@@ -59,7 +59,7 @@ while ( toAdd.Count > 0 ) {
 
 Console.WriteLine( "Total affected:" );
 
-foreach ( var a in affected ) {
+foreach ( var a in affected.Where( f => f.ToString().EndsWith( ".csproj" ) ) ) {
   Console.WriteLine( a );
 }
 
