@@ -2,85 +2,97 @@
 using Nuke.Common.IO;
 using Nuke.Common.ProjectModel;
 
-string rootRepoPath = args[0];
+var rootSln = (AbsolutePath) args[0];
 string baseCommit = args[1];
 
-var patches = GetPatches( rootRepoPath, baseCommit );
+var patches = Patches( rootSln.Parent, baseCommit );
 
-if ( patches.All( p => !p.Patch.Any() )) {
+if ( patches.All( p => !p.Patch.Any() ) ) {
   Console.WriteLine( "No changes at all ..." );
   return 0;
 }
 
-var solution = ProjectModelTasks.ParseSolution(@"C:\git\mono-repo\mono.sln");
+var solution = ProjectModelTasks.ParseSolution( rootSln );
 
-var changedFolders = patches
-  .SelectMany( p => p.Patch.Where( c => c.Mode != Mode.GitLink ).Select( f => (AbsolutePath) Path.Combine( p.WorkingDirectory, Path.GetDirectoryName( f.Path )! ) ) )
-  .Distinct()
+var changedPaths = patches
+  .SelectMany(
+    p => p.Patch.Where( c => c.Mode != Mode.GitLink )
+      //.Select( f => (AbsolutePath) Path.Combine( p.WorkingDirectory, Path.GetDirectoryName( f.Path )! ) ) )
+      .Select( f => (AbsolutePath) Path.Combine( p.WorkingDirectory, f.Path ) )
+      .Distinct() )
   .ToArray();
 
 var toAdd = new Stack<AbsolutePath>();
 
-foreach (var changedFolder in changedFolders)
-{
-  if (changedFolder == solution.Path!.Parent )
-  {
+foreach ( var changedPath in changedPaths ) {
+  if ( Equals( changedPath, solution.Path!.Parent ) ) {
     continue;
   }
 
-  // TODO: What do we want to do with changes to file not inside projects?
-  foreach (var a in solution.AllProjects.Where(k => k.Path.Parent.Contains(changedFolder)))
-  {
-    toAdd.Push(a.Path);
+  toAdd.Push( changedPath );
+
+  // Source code items are typically implicit in modern csproj files
+  // So any changes for which a project sits at the root we add the project file itself to the change set
+  // because anyone depending on that project is impact, as well as anyone referencing the changed file directly.
+  foreach ( var a in solution.AllProjects.Where( k => k.Path.Parent.Contains( changedPath ) ) ) {
+    toAdd.Push( a.Path );
   }
 }
 
 var affected = new HashSet<AbsolutePath>();
 
-var projectToUsers = CreateUsedByMap(solution);
+var fileToUsers = CreateUsedByMap( solution );
 
-while (toAdd.Count > 0)
-{
+while ( toAdd.Count > 0 ) {
   var a = toAdd.Pop();
-  if (affected.Contains(a))
-  {
+  if ( affected.Contains( a ) ) {
     continue;
   }
 
-  affected.Add(a);
-  foreach (var dep in projectToUsers[a])
-  {
-    toAdd.Push(dep);
+  affected.Add( a );
+  if ( fileToUsers.TryGetValue( a, out var users ) ) {
+    foreach ( var dep in users ) {
+      toAdd.Push( dep );
+    }
   }
 }
 
-Console.WriteLine("Total affected:");
+Console.WriteLine( "Total affected:" );
 
-foreach (var a in affected)
-{
-  Console.WriteLine(a);
+foreach ( var a in affected ) {
+  Console.WriteLine( a );
 }
 
 return 0;
 
 Dictionary<AbsolutePath, HashSet<AbsolutePath>> CreateUsedByMap( Solution sln ) {
-  HashSet<AbsolutePath> GetProjectReferences( Project p ) {
+  HashSet<AbsolutePath> ReferencedFiles( Project p ) {
     var project = p.GetMSBuildProject();
-    var paths = project.AllEvaluatedItems.Where( i => i.ItemType == "ProjectReference" )
-      .Select( pr => p.Path.Parent / pr.EvaluatedInclude )
+
+    var itemPaths = project.AllEvaluatedItems.Select(
+        pr => Path.IsPathRooted( pr.EvaluatedInclude )
+          ? (AbsolutePath) pr.EvaluatedInclude
+          : p.Path.Parent / pr.EvaluatedInclude )
+      .Where( f => File.Exists( f ) || Directory.Exists( f ) )
       .ToArray();
-    return new HashSet<AbsolutePath>( paths );
+
+    var importPaths = project.Imports.Select( i => i.ImportedProject.ProjectFileLocation.File )
+      .Where( f => p.Solution.Path!.Parent.Contains( f ) ).Select( f => (AbsolutePath)f )
+      .ToArray();
+    return new HashSet<AbsolutePath>( itemPaths.Concat( importPaths ) );
   }
 
-  var dictionary = sln.AllProjects.ToDictionary( p => p.Path, p => new HashSet<AbsolutePath>() );
+  var dictionary = sln.AllProjects.ToDictionary( p => p.Path, _ => new HashSet<AbsolutePath>() );
 
-  // TODO: We might also want to check for items with paths pointing above the project root
-  // e.g. a shared test binary file or similar
+  var fileUsages = sln.AllProjects.AsParallel()
+    .Select( p => ( project: p, usedBy: ReferencedFiles( p ) ) )
+    .ToArray();
 
-  var projectDeps = sln.AllProjects.AsParallel().Select( p => ( project: p, usedBy: GetProjectReferences( p ) ) ).ToArray();
-
-  foreach ( var entry in projectDeps ) {
+  foreach ( var entry in fileUsages ) {
     foreach ( var dep in entry.usedBy ) {
+      if ( !dictionary.ContainsKey( dep ) ) {
+        dictionary[dep] = new HashSet<AbsolutePath>();
+      }
       dictionary[dep].Add( entry.project.Path );
     }
   }
@@ -88,7 +100,7 @@ Dictionary<AbsolutePath, HashSet<AbsolutePath>> CreateUsedByMap( Solution sln ) 
   return dictionary;
 }
 
-static List<(string WorkingDirectory, Patch Patch)> GetPatches( string rootRepoPath, string rootBaseCommit ) {
+static List<(string WorkingDirectory, Patch Patch)> Patches( string rootRepoPath, string rootBaseCommit ) {
   var patches = new List<(string WorkingDirectory, Patch Patch)>();
 
   var rootRepo = new Repository( rootRepoPath );
